@@ -11,7 +11,7 @@ client = QdrantClient("http://localhost:6333")
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 model = SentenceTransformer(MODEL_NAME)
-EMBEDDING_DIM = 384  # Dimension for all-MiniLM-L6-v2
+EMBEDDING_DIM = 384  
 
 SIMILARITY_THRESHOLD = 0.5
 MAX_CHUNK_SIZE = 1024  
@@ -115,38 +115,25 @@ def embed_and_store_chunks(chunks: List[Dict], collection_name: str = "financial
     """
     print("Generating embeddings and storing in Qdrant...")
     
+    # Batch upsert is more efficient
     points = []
-    
     for idx, chunk in enumerate(tqdm(chunks)):
-        # Generate embedding
         embedding = model.encode(chunk["text"])
-        
-        # Create unique ID
         point_id = idx + 1
         
-        # Prepare payload (metadata)
         payload = {
-            "text": chunk["text"],
+            "page_content": chunk["text"], 
             "company": chunk["company"],
             "source": chunk["source"],
             "date": chunk["date"],
             "chunk_index": chunk["chunk_index"],
             "total_chunks": chunk["total_chunks"],
-            "metadata": json.dumps(chunk["metadata"])
+            "metadata": chunk["metadata"] 
         }
         
-        point = PointStruct(
-            id=point_id,
-            vector=embedding.tolist(),
-            payload=payload
-        )
-        points.append(point)
-    
-    client.upsert(
-        collection_name=collection_name,
-        points=points
-    )
-    
+        points.append(PointStruct(id=point_id, vector=embedding.tolist(), payload=payload))
+
+    client.upsert(collection_name=collection_name, points=points)
     print(f"Stored {len(points)} chunks in Qdrant")
 
 
@@ -155,32 +142,6 @@ def save_chunked_data(chunks: List[Dict], filepath: str = "data/chunked_data.jso
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(chunks, f, indent=2)
     print(f"Saved {len(chunks)} chunks to {filepath}")
-
-
-def search_chunks(query: str, collection_name: str = "financial_chunks", limit: int = 5) -> List[Dict]:
-    """
-    Search for semantically similar chunks using Qdrant.
-    """
-    query_embedding = model.encode(query)
-    
-    results = client.search(
-        collection_name=collection_name,
-        query_vector=query_embedding.tolist(),
-        limit=limit
-    )
-    
-    matches = []
-    for result in results:
-        matches.append({
-            "score": result.score,
-            "text": result.payload["text"],
-            "company": result.payload["company"],
-            "source": result.payload["source"],
-            "date": result.payload["date"],
-            "metadata": json.loads(result.payload["metadata"])
-        })
-    
-    return matches
 
 
 def main():
@@ -195,15 +156,8 @@ def main():
     create_qdrant_collection()
     embed_and_store_chunks(chunked_data)
     
-    print("\n--- Testing semantic search ---")
-    test_query = "What is the revenue of Indian tech companies?"
-    results = search_chunks(test_query)
-    
-    print(f"Top results for '{test_query}':")
-    for i, result in enumerate(results, 1):
-        print(f"\n{i}. {result['company']} ({result['source']})")
-        print(f"   Score: {result['score']:.4f}")
-        print(f"   Text: {result['text'][:200]}...")
+    print("\n--- Processing Complete ---")
+    print(f"Chunks have been uploaded to collection: financial_chunks")
 
 
 if __name__ == "__main__":
