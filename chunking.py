@@ -7,17 +7,14 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
-# Initialize Qdrant client (in-memory for now, can switch to persistent)
 client = QdrantClient("http://localhost:6333")
 
-# Load embedding model
 MODEL_NAME = "all-MiniLM-L6-v2"
 model = SentenceTransformer(MODEL_NAME)
 EMBEDDING_DIM = 384  # Dimension for all-MiniLM-L6-v2
 
-# Chunking parameters
 SIMILARITY_THRESHOLD = 0.5
-MAX_CHUNK_SIZE = 1024  # Maximum tokens per chunk to avoid overly large chunks
+MAX_CHUNK_SIZE = 1024  
 
 
 def load_processed_data(filepath: str = "data/processed_data.json") -> List[Dict]:
@@ -28,7 +25,6 @@ def load_processed_data(filepath: str = "data/processed_data.json") -> List[Dict
 
 def split_into_sentences(text: str) -> List[str]:
     """Split text into sentences."""
-    # Split by common sentence endings
     sentences = text.split('.')
     return [s.strip() for s in sentences if s.strip()]
 
@@ -43,7 +39,6 @@ def semantic_chunking(text: str, similarity_threshold: float = SIMILARITY_THRESH
     if len(sentences) <= 1:
         return [text]
     
-    # Generate embeddings for all sentences
     embeddings = model.encode(sentences, convert_to_numpy=True)
     
     chunks = []
@@ -51,14 +46,12 @@ def semantic_chunking(text: str, similarity_threshold: float = SIMILARITY_THRESH
     current_tokens = len(sentences[0].split())
     
     for i in range(1, len(sentences)):
-        # Calculate cosine similarity between consecutive sentences
         similarity = np.dot(embeddings[i-1], embeddings[i]) / (
             np.linalg.norm(embeddings[i-1]) * np.linalg.norm(embeddings[i]) + 1e-8
         )
         
         sentence_tokens = len(sentences[i].split())
         
-        # Break if: low similarity (topic shift) OR chunk exceeds max size
         if (similarity < similarity_threshold and current_chunk) or (current_tokens + sentence_tokens > MAX_CHUNK_SIZE):
             chunks.append('. '.join(current_chunk) + '.')
             current_chunk = [sentences[i]]
@@ -67,7 +60,6 @@ def semantic_chunking(text: str, similarity_threshold: float = SIMILARITY_THRESH
             current_chunk.append(sentences[i])
             current_tokens += sentence_tokens
     
-    # Add remaining sentences
     if current_chunk:
         chunks.append('. '.join(current_chunk) + '.')
     
@@ -143,7 +135,6 @@ def embed_and_store_chunks(chunks: List[Dict], collection_name: str = "financial
             "metadata": json.dumps(chunk["metadata"])
         }
         
-        # Create point
         point = PointStruct(
             id=point_id,
             vector=embedding.tolist(),
@@ -151,7 +142,6 @@ def embed_and_store_chunks(chunks: List[Dict], collection_name: str = "financial
         )
         points.append(point)
     
-    # Upsert points to Qdrant
     client.upsert(
         collection_name=collection_name,
         points=points
