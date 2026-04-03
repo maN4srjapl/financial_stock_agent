@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Union, Annotated
+from typing import List, Dict, Any, Union, Annotated, TypedDict
 import uuid
 import time
 import os
@@ -7,17 +7,15 @@ from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
 from langchain_qdrant import QdrantVectorStore
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain.tools import tool
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_neo4j import Neo4jGraph
-import requests 
 
-# Load environment variables from .env file
+from conversation_memory import ConversationMemory
+
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -30,6 +28,8 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY not found. Please set it in .env file or environment variables.")
 
+# Initialize Persistent Memory
+persistent_memory = ConversationMemory()
 
 # 1. Databases Setup
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -92,7 +92,6 @@ tool_node = ToolNode(tools, handle_tool_errors=handle_tool_error)
 basic_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0)
 advanced_model = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, temperature=0)
 
-# 5. Entity Cache for Optimization
 entity_cache = {}
 
 def get_cached_entity(entity_name: str, max_age_hours: int = 24):
@@ -110,31 +109,122 @@ def cache_entity(entity_name: str, results: str):
         "results": results
     }
 
-# 6. LangGraph Agent Loop Functions
+# 6. Extended State for Memory Context
+class AgentState(MessagesState):
+    """Extended state with memory context and user tracking."""
+    user_id: str
+    memory_context: str
+    needs_tools: bool
+    raw_response: str
 
-def call_model(state: MessagesState):
-    """Call the LLM with message history and tool bindings."""
+# 7. LangGraph Agent Loop Functions
+
+def retrieve_memory_context(state: AgentState):
+    """Step 1: Retrieve relevant context from Neo4j memory."""
     messages = state["messages"]
+    user_id = state.get("user_id", "default-user")
+    
+    if not messages:
+        return {"memory_context": "", "needs_tools": True}
+    
+    last_user_message = messages[-1].content
+    print(f"\n🔍 [STEP 1: SEARCHING MEMORY for user: {user_id}]")
+    
+    try:
+        # Search persistent memory for relevant past context
+        past_memories = persistent_memory.search_memory(
+            query=last_user_message,
+            user_id=user_id,
+            limit=5,
+            rerank=True
+        )
+        
+        if past_memories:
+            memory_context = "\n\nRELEVANT PAST CONTEXT FROM MEMORY:\n"
+            for idx, mem in enumerate(past_memories, 1):
+                memory_context += f"{idx}. {mem.get('memory', 'N/A')} (Score: {mem.get('score', 0):.2f})\n"
+            print(f"   ✓ Found {len(past_memories)} relevant memories")
+            return {"memory_context": memory_context, "needs_tools": False}
+        else:
+            print("   ⚠ No relevant memories found")
+            return {"memory_context": "", "needs_tools": True}
+    except Exception as e:
+        print(f"   ✗ Memory search failed: {e}")
+        return {"memory_context": "", "needs_tools": True}
+
+def assess_context_sufficiency(state: AgentState):
+    """Step 2: Determine if memory context is sufficient or if tools are needed."""
+    messages = state["messages"]
+    memory_context = state.get("memory_context", "")
+    
+    print(f"\n🤔 [STEP 2: ASSESSING CONTEXT SUFFICIENCY]")
+    
+    # Use LLM to determine if memory context is sufficient
+    assessment_prompt = f"""You are a context assessor. Determine if the provided memory context is sufficient to answer the user's query.
+
+User Query: {messages[-1].content}
+
+Memory Context: {memory_context if memory_context else "No memory context available"}
+
+Respond with ONLY 'SUFFICIENT' or 'INSUFFICIENT'.
+Use 'SUFFICIENT' only if the memory context directly answers the query.
+Use 'INSUFFICIENT' if you need current data, additional details, or the context is empty."""
+    
+    assessment = basic_model.invoke([{"role": "user", "content": assessment_prompt}])
+    is_sufficient = "SUFFICIENT" in assessment.content.upper()
+    
+    if is_sufficient:
+        print("   ✓ Memory context is SUFFICIENT")
+        return {"needs_tools": False}
+    else:
+        print("   ⚠ Memory context is INSUFFICIENT - tools required")
+        return {"needs_tools": True}
+
+def call_model_with_context(state: AgentState):
+    """Step 3a: Generate response using memory context only (no tools)."""
+    messages = state["messages"]
+    memory_context = state.get("memory_context", "")
+    
+    print(f"\n💬 [STEP 3a: GENERATING RESPONSE FROM MEMORY]")
+    
+    model = advanced_model
+    
+    system_prompt = f"""You are a Financial Copilot AI assistant. Answer the user's query using the provided memory context.
+
+{memory_context}
+
+Provide a clear, concise answer based on this context. Acknowledge that this is from previous conversations."""
+
+    response = model.invoke([
+        {"role": "system", "content": system_prompt},
+        *messages
+    ])
+    
+    return {"messages": [response], "raw_response": response.content}
+
+def call_model_with_tools(state: AgentState):
+    """Step 3b: Generate response using tools for fresh data."""
+    messages = state["messages"]
+    memory_context = state.get("memory_context", "")
+    
+    print(f"\n🛠️  [STEP 3b: GENERATING RESPONSE WITH TOOLS]")
     
     # Dynamic Model Selection
     last_message_content = messages[-1].content if messages else ""
     if len(last_message_content.split()) > 10 or "analyze" in last_message_content.lower() or "compare" in last_message_content.lower():
-        print("[System] Using Advanced Model (gpt-4o)")
         model = advanced_model.bind_tools(tools)
     else:
-        print("[System] Using Basic Model (gpt-4o-mini)")
         model = basic_model.bind_tools(tools)
     
-    # System prompt with memory context
-    system_prompt = """You are a Financial Copilot AI assistant. You help analyze financial data, business segments, and company performance.
+    system_prompt = f"""You are a Financial Copilot AI assistant. You help analyze financial data, business segments, and company performance.
+
+{memory_context}
 
 IMPORTANT GUIDELINES:
-1. Use the conversation history to provide context-aware answers
-2. Leverage previous tool calls to avoid redundant searches
-3. When referring to past information, acknowledge it was discussed earlier
-4. Always verify current data with fresh tool searches when needed
-5. Be transparent about which tools you're using and why
-6. Combine insights from multiple sources (Vector DB, Graph DB, News, Earnings)
+1. Use tools to fetch current, accurate data
+2. Combine memory context with fresh tool results
+3. Be transparent about data sources
+4. Prioritize recent data from tools over memory
 
 Tools available:
 - search_vector_db: For deep historical context and document snippets
@@ -149,136 +239,171 @@ Tools available:
     
     return {"messages": [response]}
 
-def should_continue(state: MessagesState):
-    """Determine if tool execution is needed or if we should finalize the answer."""
+def enrich_and_refine_response(state: AgentState):
+    """Step 4: Enrich and refine the final response before storing."""
+    messages = state["messages"]
+    user_id = state.get("user_id", "default-user")
+    
+    print(f"\n✨ [STEP 4: ENRICHING & REFINING RESPONSE]")
+    
+    last_response = messages[-1].content
+    
+    # Enrichment prompt
+    enrichment_prompt = f"""You are a response enhancer. Take the following response and:
+1. Add relevant context and explanations
+2. Structure it clearly with bullet points or sections
+3. Ensure accuracy and completeness
+4. Keep it concise but informative
+
+Original Response:
+{last_response}
+
+Provide the ENRICHED version:"""
+    
+    enriched = advanced_model.invoke([{"role": "user", "content": enrichment_prompt}])
+    
+    print("   ✓ Response enriched and refined")
+    
+    # Update the last message with enriched content
+    messages[-1] = AIMessage(content=enriched.content)
+    
+    return {"messages": messages, "raw_response": enriched.content}
+
+def store_in_memory(state: AgentState):
+    """Step 5: Store the enriched conversation in persistent memory."""
+    messages = state["messages"]
+    user_id = state.get("user_id", "default-user")
+    
+    print(f"\n💾 [STEP 5: STORING IN MEMORY]")
+    
+    try:
+        # Find the last user message and assistant response
+        user_msg = None
+        assistant_msg = None
+        
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and assistant_msg is None:
+                assistant_msg = msg.content
+            elif isinstance(msg, HumanMessage) and user_msg is None:
+                user_msg = msg.content
+            
+            if user_msg and assistant_msg:
+                break
+        
+        if user_msg and assistant_msg:
+            conversation_turn = [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": assistant_msg}
+            ]
+            
+            # Extract metadata
+            metadata = {
+                "timestamp": datetime.now().isoformat(),
+                "used_tools": state.get("needs_tools", False)
+            }
+            
+            # Add keywords if they exist
+            keywords = []
+            for keyword in ["Reliance", "segment", "earnings", "news", "analysis", "business"]:
+                if keyword.lower() in user_msg.lower():
+                    keywords.append(keyword)
+            if keywords:
+                metadata["keywords"] = keywords
+            
+            persistent_memory.add_memory(
+                conversation_turn,
+                user_id=user_id,
+                metadata=metadata
+            )
+            print("   ✓ Conversation stored successfully")
+    except Exception as e:
+        print(f"   ✗ Failed to store in memory: {e}")
+    
+    return {"messages": messages}
+
+def route_based_on_context(state: AgentState):
+    """Router: Decide whether to use memory-only or tools-based response."""
+    needs_tools = state.get("needs_tools", True)
+    
+    if needs_tools:
+        return "call_with_tools"
+    else:
+        return "call_with_memory"
+
+def should_continue(state: AgentState):
+    """Determine if tool execution is needed or if we should proceed to enrichment."""
     last_message = state["messages"][-1]
     
     # If the last message has tool calls, go to tools node
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tools"
     
-    # Otherwise, we're done
-    return END
+    # Otherwise, proceed to enrichment
+    return "enrich"
 
-# 7. Build the LangGraph
-workflow = StateGraph(MessagesState)
+# 8. Build the LangGraph with New Flow
+workflow = StateGraph(AgentState)
 
-# Add nodes
-workflow.add_node("agent", call_model)
+# Add nodes for the new flow
+workflow.add_node("retrieve_memory", retrieve_memory_context)
+workflow.add_node("assess_context", assess_context_sufficiency)
+workflow.add_node("call_with_memory", call_model_with_context)
+workflow.add_node("call_with_tools", call_model_with_tools)
 workflow.add_node("tools", tool_node)
+workflow.add_node("enrich", enrich_and_refine_response)
+workflow.add_node("store", store_in_memory)
 
-# Set the entry point
-workflow.add_edge(START, "agent")
+# Define the flow
+workflow.add_edge(START, "retrieve_memory")  # Step 1: Search memory
+workflow.add_edge("retrieve_memory", "assess_context")  # Step 2: Assess sufficiency
+workflow.add_conditional_edges("assess_context", route_based_on_context)  # Route based on needs_tools
 
-# Add conditional edges
-workflow.add_conditional_edges("agent", should_continue)
+# Memory-only path
+workflow.add_edge("call_with_memory", "enrich")
 
-# Tools always loop back to agent for next decision
-workflow.add_edge("tools", "agent")
+# Tools path
+workflow.add_conditional_edges("call_with_tools", should_continue)  # Check if tools needed
+workflow.add_edge("tools", "call_with_tools")  # Loop back after tool execution
 
-# 8. Setup Checkpointer for Memory
-checkpointer = MemorySaver()
+# Final steps (common path)
+workflow.add_edge("enrich", "store")  # Step 4: Enrich then store
+workflow.add_edge("store", END)  # Step 5: End after storing
 
 # 9. Compile the graph
-app = workflow.compile(checkpointer=checkpointer)
+app = workflow.compile()
 
-# 10. Conversation Manager
-class ConversationManager:
-    """Manages multiple conversations with persistent memory."""
-    
-    def __init__(self):
-        self.conversations = {}  # {thread_id: conversation_metadata}
-    
-    def start_conversation(self, user_id: str = None) -> str:
-        """Start a new conversation and return thread ID."""
-        thread_id = str(uuid.uuid4())
-        self.conversations[thread_id] = {
-            "user_id": user_id or "anonymous",
-            "created_at": datetime.now(),
-            "message_count": 0
-        }
-        print(f"\n[Conversation Started] Thread ID: {thread_id}")
-        return thread_id
-    
-    def chat(self, thread_id: str, user_query: str) -> str:
-        """Send a message in an existing conversation."""
-        if thread_id not in self.conversations:
-            raise ValueError(f"Thread {thread_id} not found. Start a new conversation first.")
-        
-        # Prepare input
-        inputs = {"messages": [HumanMessage(content=user_query)]}
-        config = {"configurable": {"thread_id": thread_id}}
-        
-        # Invoke the agent
-        print(f"\n[User Query]: {user_query}")
-        final_state = app.invoke(inputs, config=config)
-        
-        # Update conversation metadata
-        self.conversations[thread_id]["message_count"] += 1
-        
-        # Extract and return the final answer
-        last_message = final_state["messages"][-1]
-        return last_message.content
-    
-    def get_conversation_history(self, thread_id: str) -> List[Dict]:
-        """Retrieve full conversation history."""
-        if thread_id not in self.conversations:
-            raise ValueError(f"Thread {thread_id} not found.")
-        
-        # Retrieve state from checkpointer
-        config = {"configurable": {"thread_id": thread_id}}
-        state = app.get_state(config)
-        
-        history = []
-        for msg in state.values.get("messages", []):
-            history.append({
-                "role": "user" if isinstance(msg, HumanMessage) else "assistant",
-                "content": msg.content,
-                "timestamp": datetime.now().isoformat()
-            })
-        return history
-    
-    def clear_conversation(self, thread_id: str):
-        """Clear a conversation from memory."""
-        if thread_id in self.conversations:
-            del self.conversations[thread_id]
-            print(f"[Conversation Cleared] Thread ID: {thread_id}")
-
-# 11. Main Execution
+# 10. Main Execution
 if __name__ == "__main__":
-    # Create conversation manager
-    manager = ConversationManager()
-    
-    # Start a new conversation
-    thread_id = manager.start_conversation(user_id="demo_user")
-    
-    # Multi-turn conversation example
     print("\n" + "="*80)
-    print("FINANCIAL COPILOT - MULTI-TURN CONVERSATION WITH MEMORY")
+    print("FINANCIAL COPILOT - MEMORY-FIRST AGENT")
+    print("="*80)
+    print("Flow: Search Memory → Assess → Route → Enrich → Store")
     print("="*80)
     
-    # Query 1
-    query1 = "What information do we have about Reliance business segments?"
-    answer1 = manager.chat(thread_id, query1)
-    print(f"\n[Assistant]: {answer1}")
+    # Set user ID for this session
+    user_id = "analyst-001"
     
-    # Query 2 (uses context from Query 1)
-    query2 = "Tell me more about their oil and hydrocarbon operations."
-    answer2 = manager.chat(thread_id, query2)
-    print(f"\n[Assistant]: {answer2}")
+    # Single query example
+    query = "What information do we have about Reliance business segments?"
+    print(f"\n[User Query]: {query}")
     
-    # Query 3 (multi-tool reasoning)
-    query3 = "How has their performance been recently? Analyze the trends."
-    answer3 = manager.chat(thread_id, query3)
-    print(f"\n[Assistant]: {answer3}")
+    inputs = {
+        "messages": [HumanMessage(content=query)],
+        "user_id": user_id,
+        "memory_context": "",
+        "needs_tools": True,
+        "raw_response": ""
+    }
     
-    # Display conversation history
-    print("\n" + "="*80)
-    print("CONVERSATION HISTORY")
+    final_state = app.invoke(inputs)
+    
+    # Extract and display the final answer
+    last_message = final_state["messages"][-1]
+    print(f"\n{'='*80}")
+    print("[FINAL ENRICHED RESPONSE]:")
     print("="*80)
-    history = manager.get_conversation_history(thread_id)
-    for i, msg in enumerate(history):
-        print(f"\n[Turn {i+1}] {msg['role'].upper()}: {msg['content'][:100]}...")
+    print(last_message.content)
+    print("\n" + "="*80)
 
 
 
