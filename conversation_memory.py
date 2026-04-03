@@ -1,350 +1,187 @@
-"""
-Conversation Memory Manager
-Stores and retrieves conversation history using Qdrant vector database.
-Enables semantic search across past conversations.
-"""
+import os
+from typing import List, Dict, Optional, Any
+from mem0 import Memory
+from dotenv import load_dotenv
 
-import uuid
-import json
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from langchain_core.documents import Document
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct
-import hashlib
+# Load environment variables
+load_dotenv()
 
 
-class ConversationMemoryManager:
+class ConversationMemory:
     """
-    Manages conversation history storage and retrieval in Qdrant.
-    Each conversation exchange (user query + assistant response) is embedded and stored.
+    A conversation memory system using mem0 with Neo4j graph store.
+    Provides functionality to add, search, and delete conversation memories.
     """
     
-    def __init__(self, qdrant_url: str = "http://localhost:6333", collection_name: str = "conversation_history"):
-        """
-        Initialize the conversation memory manager.
+    def __init__(self):
+        """Initialize the memory system with Neo4j configuration."""
+        # Get API key from environment
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not found. Please set it in .env file or environment variables.")
         
-        Args:
-            qdrant_url: URL of Qdrant server
-            collection_name: Name of collection to store conversations
-        """
-        self.qdrant_url = qdrant_url
-        self.collection_name = collection_name
-        self.client = QdrantClient(url=qdrant_url)
-        
-        # Initialize embeddings
-        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        # Create or get collection
-        self._ensure_collection_exists()
+        self.config = {
+            "graph_store": {
+                "provider": "neo4j",
+                "config": {
+                    "url": os.environ.get("NEO4J_URL", "bolt://localhost:7687"),
+                    "username": os.environ.get("NEO4J_USERNAME", "neo4j"),
+                    "password": os.environ.get("NEO4J_PASSWORD", "12345678"),
+                    "database": "neo4j",
+                }
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {
+                    "api_key": openai_api_key,
+                    "model": "text-embedding-3-small",
+                    "embedding_dims": 1536
+                }
+            }
+        }
+        self.memory = Memory.from_config(self.config)
     
-    def _ensure_collection_exists(self):
-        """Create Qdrant collection if it doesn't exist."""
-        from qdrant_client.http.models import VectorParams, Distance
+    def add_memory(
+        self, 
+        conversation: List[Dict[str, str]], 
+        user_id: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         
         try:
-            self.client.get_collection(self.collection_name)
-            print(f"✓ Collection '{self.collection_name}' already exists")
-        except:
-            print(f"Creating collection '{self.collection_name}'...")
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(
-                    size=384,  # all-MiniLM-L6-v2 embedding dimension
-                    distance=Distance.COSINE
-                )
+            result = self.memory.add(
+                conversation, 
+                user_id=user_id,
+                metadata=metadata
             )
-            print(f"✓ Collection '{self.collection_name}' created successfully")
+            print(f"✓ Memory added successfully for user: {user_id}")
+            return result
+        except Exception as e:
+            print(f"✗ Error adding memory: {str(e)}")
+            raise
     
-    def save_conversation_turn(
-        self,
-        thread_id: str,
-        user_query: str,
-        assistant_response: str,
-        tools_used: List[str] = None
-    ) -> str:
-        """
-        Save a single conversation turn (user query + assistant response) to Qdrant.
-        
-        Args:
-            thread_id: Unique conversation thread identifier
-            user_query: User's question/input
-            assistant_response: Assistant's response
-            tools_used: List of tools invoked (e.g., ["search_graph_db", "get_earnings"])
-        
-        Returns:
-            Point ID (unique conversation turn identifier)
-        """
-        if tools_used is None:
-            tools_used = []
-        
-        # Create combined text for embedding
-        combined_text = f"Query: {user_query}\n\nResponse: {assistant_response}"
-        
-        # Generate embedding
-        embedding = self.embeddings.embed_query(combined_text)
-        
-        # Create unique ID for this turn
-        turn_id = int(hashlib.md5(f"{thread_id}{user_query}{datetime.now().isoformat()}".encode()).hexdigest(), 16) % (10**10)
-        
-        # Prepare metadata
-        metadata = {
-            "thread_id": thread_id,
-            "user_query": user_query,
-            "assistant_response": assistant_response,
-            "tools_used": json.dumps(tools_used),
-            "timestamp": datetime.now().isoformat(),
-            "turn_number": self._get_turn_count(thread_id) + 1
-        }
-        
-        # Create and upload point
-        point = PointStruct(
-            id=turn_id,
-            vector=embedding,
-            payload=metadata
-        )
-        
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=[point]
-        )
-        
-        print(f"✓ Saved conversation turn {metadata['turn_number']} for thread {thread_id}")
-        return str(turn_id)
-    
-    def search_conversations(
-        self,
-        query: str,
-        thread_id: Optional[str] = None,
-        limit: int = 5
+    def search_memory(
+        self, 
+        query: str, 
+        user_id: str,
+        limit: int = 5,
+        rerank: bool = True
     ) -> List[Dict[str, Any]]:
+        try:
+            results = self.memory.search(
+                query,
+                user_id=user_id,
+                limit=limit,
+                rerank=rerank
+            )
+            
+            print(f"\n🔍 Found {len(results.get('results', []))} results for: '{query}'")
+            return results.get("results", [])
+        except Exception as e:
+            print(f"✗ Error searching memory: {str(e)}")
+            raise
+    
+    def delete_memory(
+        self, 
+        memory_id: str,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Search across conversation history using semantic similarity.
+        Delete a specific memory by ID.
         
         Args:
-            query: Search query (e.g., "What was discussed about Reliance's strategy?")
-            thread_id: Optional - filter results to specific conversation thread
-            limit: Maximum number of results to return
-        
+            memory_id: The ID of the memory to delete
+            user_id: Optional user ID for verification
+            
         Returns:
-            List of relevant past conversation turns with scores
+            Result from the delete operation
+            
+        Example:
+            >>> memory.delete_memory(memory_id="mem-123", user_id="user-123")
         """
-        # Generate embedding for search query
-        query_embedding = self.embeddings.embed_query(query)
-        
-        # Build filter if thread_id specified
-        filter_condition = None
-        if thread_id:
-            filter_condition = {
-                "must": [
-                    {
-                        "key": "thread_id",
-                        "match": {"value": thread_id}
-                    }
-                ]
-            }
-        
-        # Search in Qdrant
-        results = self.client.search(
-            collection_name=self.collection_name,
-            query_vector=query_embedding,
-            query_filter=filter_condition,
-            limit=limit
-        )
-        
-        # Format results
-        formatted_results = []
-        for result in results:
-            formatted_results.append({
-                "score": result.score,
-                "turn_id": result.id,
-                "query": result.payload.get("user_query", ""),
-                "response": result.payload.get("assistant_response", ""),
-                "tools_used": json.loads(result.payload.get("tools_used", "[]")),
-                "timestamp": result.payload.get("timestamp", ""),
-                "thread_id": result.payload.get("thread_id", "")
-            })
-        
-        return formatted_results
+        try:
+            result = self.memory.delete(memory_id=memory_id)
+            print(f"✓ Memory deleted successfully: {memory_id}")
+            return result
+        except Exception as e:
+            print(f"✗ Error deleting memory: {str(e)}")
+            raise
     
-    def get_thread_history(self, thread_id: str) -> List[Dict[str, Any]]:
-        """
-        Retrieve all conversation turns for a specific thread in chronological order.
-        
-        Args:
-            thread_id: Conversation thread identifier
-        
-        Returns:
-            List of all conversation turns in order
-        """
-        # Use scroll to get all points for a thread
-        points, _ = self.client.scroll(
-            collection_name=self.collection_name,
-            limit=100,
-            scroll_filter={
-                "must": [
-                    {
-                        "key": "thread_id",
-                        "match": {"value": thread_id}
-                    }
-                ]
-            }
-        )
-        
-        # Format and sort by turn number
-        history = []
-        for point in points:
-            history.append({
-                "turn_number": point.payload.get("turn_number", 0),
-                "query": point.payload.get("user_query", ""),
-                "response": point.payload.get("assistant_response", ""),
-                "tools_used": json.loads(point.payload.get("tools_used", "[]")),
-                "timestamp": point.payload.get("timestamp", "")
-            })
-        
-        # Sort by turn number
-        history.sort(key=lambda x: x["turn_number"])
-        return history
+    def delete_all_memories(self, user_id: str) -> Dict[str, Any]:
+        try:
+            result = self.memory.delete_all(user_id=user_id)
+            print(f"✓ All memories deleted for user: {user_id}")
+            return result
+        except Exception as e:
+            print(f"✗ Error deleting all memories: {str(e)}")
+            raise
     
-    def get_turn_count(self, thread_id: str) -> int:
-        """Get total number of turns in a conversation thread."""
-        points, _ = self.client.scroll(
-            collection_name=self.collection_name,
-            limit=1,
-            scroll_filter={
-                "must": [
-                    {
-                        "key": "thread_id",
-                        "match": {"value": thread_id}
-                    }
-                ]
-            }
-        )
-        
-        max_turn = 0
-        for point in points:
-            turn_num = point.payload.get("turn_number", 0)
-            if turn_num > max_turn:
-                max_turn = turn_num
-        
-        return max_turn
+    def get_all_memories(self, user_id: str) -> List[Dict[str, Any]]:
+
+        try:
+            memories = self.memory.get_all(user_id=user_id)
+            print(f" Retrieved {len(memories)} memories for user: {user_id}")
+            return memories
+        except Exception as e:
+            print(f"✗ Error retrieving memories: {str(e)}")
+            raise
     
-    def _get_turn_count(self, thread_id: str) -> int:
-        """Internal helper to get turn count."""
-        return self.get_turn_count(thread_id)
-    
-    def get_related_context(
-        self,
-        thread_id: str,
-        current_query: str,
-        limit: int = 3
-    ) -> str:
-        """
-        Get related past conversation context for the current query.
-        Useful for injecting relevant historical context into the LLM prompt.
-        
-        Args:
-            thread_id: Current conversation thread
-            current_query: Current user query
-            limit: Number of past turns to retrieve
-        
-        Returns:
-            Formatted string with related past context
-        """
-        # Search for similar past queries in same thread
-        similar = self.search_conversations(current_query, thread_id=thread_id, limit=limit)
-        
-        if not similar:
-            return ""
-        
-        context = "\n📚 Related Context from Past Discussions:\n"
-        for i, item in enumerate(similar, 1):
-            context += f"\n({i}) User asked: {item['query'][:100]}...\n"
-            context += f"    Assistant responded: {item['response'][:100]}...\n"
-        
-        return context
-    
-    def export_thread(self, thread_id: str, format: str = "json") -> str:
-        """
-        Export a full conversation thread.
-        
-        Args:
-            thread_id: Conversation thread to export
-            format: Export format ('json' or 'markdown')
-        
-        Returns:
-            Formatted conversation thread
-        """
-        history = self.get_thread_history(thread_id)
-        
-        if format == "json":
-            return json.dumps({
-                "thread_id": thread_id,
-                "conversation": history,
-                "exported_at": datetime.now().isoformat()
-            }, indent=2)
-        
-        elif format == "markdown":
-            md = f"# Conversation: {thread_id}\n\n"
-            for turn in history:
-                md += f"## Turn {turn['turn_number']}\n"
-                md += f"**User:** {turn['query']}\n\n"
-                md += f"**Assistant:** {turn['response']}\n\n"
-                md += f"_Tools Used: {', '.join(turn['tools_used']) or 'None'}_\n\n"
-                md += f"_Time: {turn['timestamp']}_\n\n---\n\n"
-            return md
-        
-        return str(history)
-    
-    def clear_collection(self):
-        """Delete all conversation history from the collection."""
-        self.client.delete_collection(self.collection_name)
-        print(f"✓ Cleared all data from collection '{self.collection_name}'")
-        self._ensure_collection_exists()
+    def update_memory(
+        self, 
+        memory_id: str,
+        data: Dict[str, Any],
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        try:
+            result = self.memory.update(memory_id=memory_id, data=data)
+            print(f"✓ Memory updated successfully: {memory_id}")
+            return result
+        except Exception as e:
+            print(f"✗ Error updating memory: {str(e)}")
+            raise
 
 
-# Example usage
+def demo_usage():
+    
+    memory = ConversationMemory()
+    
+    # Example 1: Add a conversation
+    print("\n1. Adding a conversation to memory...")
+    conversation1 = [
+        {"role": "user", "content": "Alice met Bob at GraphConf 2025 in San Francisco."},
+        {"role": "assistant", "content": "Great! I've logged that connection."},
+    ]
+    memory.add_memory(conversation1, user_id="demo-user")
+    
+    # Example 2: Add another conversation
+    print("\n2. Adding another conversation...")
+    conversation2 = [
+        {"role": "user", "content": "Bob is working on a graph database project."},
+        {"role": "assistant", "content": "Interesting! I'll remember that about Bob."},
+    ]
+    memory.add_memory(conversation2, user_id="demo-user")
+    
+    # Example 3: Search for memories
+    print("\n3. Searching for memories...")
+    results = memory.search_memory(
+        "Who did Alice meet at GraphConf?",
+        user_id="demo-user",
+        limit=3,
+        rerank=True
+    )
+    
+    print("\nSearch Results:")
+    for idx, hit in enumerate(results, 1):
+        print(f"{idx}. {hit.get('memory', 'N/A')}")
+        print(f"   Score: {hit.get('score', 'N/A')}")
+        print(f"   ID: {hit.get('id', 'N/A')}\n")
+    
+    # Example 4: Get all memories
+    print("\n4. Getting all memories for user...")
+    all_memories = memory.get_all_memories(user_id="demo-user")
+    print(f"Total memories: {len(all_memories)}")
+
+
 if __name__ == "__main__":
-    # Initialize memory manager
-    memory = ConversationMemoryManager()
-    
-    # Simulate saving conversation turns
-    thread_id = str(uuid.uuid4())
-    print(f"\n--- Testing Conversation Memory (Thread: {thread_id[:8]}...) ---\n")
-    
-    # Turn 1
-    memory.save_conversation_turn(
-        thread_id=thread_id,
-        user_query="What are Reliance's business segments?",
-        assistant_response="Reliance operates in Oil, Hydrocarbon, Chemicals, and AI sectors.",
-        tools_used=["search_graph_db"]
-    )
-    
-    # Turn 2
-    memory.save_conversation_turn(
-        thread_id=thread_id,
-        user_query="Tell me about their oil operations",
-        assistant_response="Reliance's oil segment includes refining and production of various petroleum products.",
-        tools_used=["search_vector_db"]
-    )
-    
-    # Search test
-    print("\n--- Semantic Search Results ---\n")
-    search_results = memory.search_conversations("Reliance petroleum products", thread_id=thread_id)
-    for i, result in enumerate(search_results, 1):
-        print(f"Result {i} (Score: {result['score']:.3f})")
-        print(f"Query: {result['query']}")
-        print(f"Response: {result['response'][:100]}...\n")
-    
-    # Get history
-    print("\n--- Full Thread History ---\n")
-    history = memory.get_thread_history(thread_id)
-    for turn in history:
-        print(f"Turn {turn['turn_number']}: {turn['query']}")
-    
-    # Export
-    print("\n--- Exported as Markdown ---\n")
-    exported = memory.export_thread(thread_id, format="markdown")
-    print(exported[:300] + "...")
+    # Run the demo
+    demo_usage()
